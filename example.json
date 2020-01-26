@@ -1,0 +1,7 @@
+{
+  "jobId": "testjobid",
+  "configFile": "https://gist.githubusercontent.com/tg44/5958adc6c26aa92bc382becf5ccccb5d/raw/d2d274d404a11db2a4ddebc1d54ed91e92caf70e/config.ini",
+  "file": "https://github.com/sn4k3/Ender3/raw/master/TestSTLs/1Layer20x20.stl",
+  "params": {
+  }
+}
