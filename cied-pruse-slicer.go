@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -107,18 +108,15 @@ func receive(ch amqp.Channel, queue amqp.Queue, doneQueue amqp.Queue, s *session
 
 	go func() {
 		for d := range msgs {
-			jobid, outpath, runtime, err := processJob(d.Body, s, bucket)
+			jobid, command, stdout, stderr, outpath, runtime, err := processJob(d.Body, s, bucket)
 			if jobid == "" {
 				log.Printf("There was a json parse error! %s", d.Body)
 			} else {
+				doneMsg := FinishedJobMessage{jobid, outpath, err, runtime, stdout, stderr, command}
+				send(ch, doneQueue, doneMsg)
 				if err != nil {
-					str := err.Error()
-					doneMsg := FinishedJobMessage{jobid, outpath, &str, runtime}
-					send(ch, doneQueue, doneMsg)
-					log.Printf("%s failed in %d ms err: %s", jobid, runtime, err)
+					log.Printf("%s failed in %d ms with %s", jobid, runtime, err.Error())
 				} else {
-					doneMsg := FinishedJobMessage{jobid, outpath, nil, runtime}
-					send(ch, doneQueue, doneMsg)
 					log.Printf("%s finished in %d ms", jobid, runtime)
 				}
 			}
@@ -147,36 +145,37 @@ func send(ch amqp.Channel, queue amqp.Queue, msg FinishedJobMessage) {
 	}
 }
 
-func processJob(js []byte, s *session.Session, s3Bucket string) (string, string, int64, error) {
+//jobid, command, stdout, stderr, fileurl, time, error
+func processJob(js []byte, s *session.Session, s3Bucket string) (string, string, string, string, string, int64, error) {
 	start := time.Now()
 
 	var parsedMsg JobMessage
 	err := json.Unmarshal(js, &parsedMsg)
 	if err != nil {
-		return "", "", time.Since(start).Milliseconds(), err
+		return "", "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s starting job", parsedMsg.JobID)
 	dir, err := ioutil.TempDir("", "job")
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	defer os.RemoveAll(dir)
 	err = downloadFiles(dir, parsedMsg.File, parsedMsg.ConfigFile)
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, "", "", "", "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s download completed", parsedMsg.JobID)
-	err = runSlicer(parsedMsg, dir)
+	command, stdOut, stdErr, err := runSlicer(parsedMsg, dir)
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, command, stdOut, stdErr, "", time.Since(start).Milliseconds(), err
 	}
 	log.Printf("%s render completed", parsedMsg.JobID)
 	url, err := uploadFileToS3(s, s3Bucket, filepath.Join(dir, "output.gcode"), filepath.Join(parsedMsg.JobID, "output.gcode"))
 	if err != nil {
-		return parsedMsg.JobID, "", time.Since(start).Milliseconds(), err
+		return parsedMsg.JobID, command, stdOut, stdErr, "", time.Since(start).Milliseconds(), err
 	}
 
-	return parsedMsg.JobID, url, time.Since(start).Milliseconds(), nil
+	return parsedMsg.JobID, command, stdOut, stdErr, url, time.Since(start).Milliseconds(), nil
 }
 
 func downloadFiles(dir string, file string, configFile string) error {
@@ -211,7 +210,7 @@ func downloadOneFile(dir string, url string) error {
 	return err
 }
 
-func runSlicer(jm JobMessage, dir string) error {
+func runSlicer(jm JobMessage, dir string) (string, string, string, error) {
 	cmd := exec.Command("prusa-slicer")
 	cmd.Dir = dir
 	cmd.Args = append(cmd.Args, "-g", path.Base(jm.File))
@@ -230,13 +229,10 @@ func runSlicer(jm JobMessage, dir string) error {
 
 	err := cmd.Run()
 
-	log.Printf("%s", out.String())
-	log.Printf("%s", out2.String())
-
 	if err != nil {
-		return fmt.Errorf("%s; stderr: %s", err.Error(), out2.String())
+		return strings.Join(cmd.Args," "), out.String(), out2.String(), err
 	}
-	return nil
+	return strings.Join(cmd.Args," "), out.String(), out2.String(), nil
 }
 
 func uploadFileToS3(s *session.Session, s3Bucket string, fileDir string, outFileName string) (string, error) {
@@ -276,13 +272,16 @@ func readEnvOrFallback(env string, defVal string) string {
 type FinishedJobMessage struct {
 	JobID  string   `json:"jobId"`
 	File string     `json:"file"`
-	Error *string `json:"error"`
+	Error error `json:"error"`
 	Runtime int64 `json:"runTime"`
+	StdOut string `json:"stdOut"`
+	StdErr string `json:"stdErr"`
+	CommandInfo string `json:"commandInfo"`
 }
 
 type JobMessage struct {
 	JobID  string   `json:"jobId"`
-	ConfigFile string     `json:"configFile"`
+	ConfigFile string     `json:"profileFile"`
 	File  string `json:"file"`
 	ParamsRaw map[string]interface{} `json:"params"`
 }
